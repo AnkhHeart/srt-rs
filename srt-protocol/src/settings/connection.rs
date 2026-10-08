@@ -19,6 +19,8 @@ pub struct ConnInitSettings {
     pub too_late_packet_drop: bool,
     /// Receive buffer size in packets
     pub recv_buffer_size: options::PacketCount,
+    /// How far the receiver's reorder tolerance may grow (SRTO_LOSSMAXTTL)
+    pub recv_reorder_tolerance_max: options::PacketCount,
     /// Size of the send buffer, in packets
     pub send_buffer_size: options::PacketCount,
     pub max_packet_size: options::PacketSize,
@@ -64,6 +66,7 @@ impl From<options::SocketOptions> for ConnInitSettings {
             statistics_interval: options.session.statistics_interval,
             recv_buffer_size: options.receiver.buffer_size
                 / (options.session.max_segment_size - Packet::HEADER_SIZE),
+            recv_reorder_tolerance_max: options.receiver.reorder_tolerance_max,
             send_buffer_size: options.sender.buffer_size
                 / (options.session.max_segment_size - Packet::HEADER_SIZE),
             max_packet_size: options.sender.max_payload_size,

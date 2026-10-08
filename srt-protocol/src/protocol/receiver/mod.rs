@@ -74,7 +74,8 @@ impl Receiver {
                 settings.too_late_packet_drop,
                 settings.init_seq_num,
                 settings.recv_buffer_size,
-            ),
+            )
+            .with_reorder_tolerance_max(settings.recv_reorder_tolerance_max),
             decryption: Decryption::new(settings.cipher),
         }
     }

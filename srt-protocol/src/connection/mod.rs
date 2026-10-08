@@ -71,6 +71,8 @@ pub struct ConnectionSettings {
 
     /// Size of the receive buffer, in packets
     pub recv_buffer_size: PacketCount,
+    /// How far the receiver's reorder tolerance may grow (SRTO_LOSSMAXTTL)
+    pub recv_reorder_tolerance_max: PacketCount,
     /// Size of the send buffer, in packets
     pub send_buffer_size: PacketCount,
     pub cipher: Option<CipherSettings>,
@@ -213,7 +215,8 @@ impl DuplexConnection {
                 Some(data)
             }
             Err(error) => {
-                self.warn(now, "output", &error);
+                // too-late drops are routine on a lossy link; counted in rx_dropped_data
+                self.debug(now, "output", &error);
                 let dropped = error.too_late_packets.end - error.too_late_packets.start;
                 self.stats.rx_dropped_data += dropped as u64;
                 None
@@ -483,6 +486,7 @@ mod duplex_connection {
                 send_tsbpd_latency: TSBPD,
                 recv_tsbpd_latency: TSBPD,
                 recv_buffer_size: PacketCount(1024),
+                recv_reorder_tolerance_max: PacketCount(0),
                 send_buffer_size: PacketCount(1024),
                 cipher: None,
                 stream_id: None,

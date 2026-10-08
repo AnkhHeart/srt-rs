@@ -20,6 +20,10 @@ pub struct LostPacket {
     data_sequence_number: SeqNumber,
     feedback_time: Instant,
     k: i32,
+    /// While set, the gap is still within the reorder tolerance: no loss
+    /// report goes out until a packet with at least this sequence number
+    /// has arrived (in the hope that the missing packet is merely late).
+    fresh_until: Option<SeqNumber>,
 }
 
 impl LostPacket {
@@ -28,6 +32,7 @@ impl LostPacket {
             data_sequence_number,
             feedback_time,
             k: 2,
+            fresh_until: None,
         }
     }
 }
@@ -180,7 +185,21 @@ pub struct ReceiveBuffer {
     remote_clock: SynchronizedRemoteClock,
     buffer: VecDeque<BufferPacket>,
     max_buffer_size: PacketCount,
+
+    /// SRTO_LOSSMAXTTL, the reorder tolerance's ceiling; 0 turns it off.
+    reorder_tolerance_max: u32,
+    /// How many packets must follow a gap before it is reported as loss.
+    /// Starts at 0 and follows the reordering actually seen.
+    reorder_tolerance: u32,
+    /// In-order arrivals since the last reordering.
+    in_order_run: u32,
+    /// The oldest lost packet that is still waiting out the tolerance.
+    fresh_from: Option<SeqNumber>,
 }
+
+/// Consecutive in-order packets after which the reorder tolerance shrinks by
+/// one, as in libsrt.
+const REORDER_DECAY_PACKETS: u32 = 50;
 
 impl ReceiveBuffer {
     pub fn new(
@@ -200,7 +219,17 @@ impl ReceiveBuffer {
             remote_clock: SynchronizedRemoteClock::new(socket_start_time),
             buffer: VecDeque::with_capacity(max_buffer_size.into()),
             max_buffer_size,
+            reorder_tolerance_max: 0,
+            reorder_tolerance: 0,
+            in_order_run: 0,
+            fresh_from: None,
         }
+    }
+
+    /// Lets the reorder tolerance grow up to `max` packets (SRTO_LOSSMAXTTL).
+    pub fn with_reorder_tolerance_max(mut self, max: PacketCount) -> Self {
+        self.reorder_tolerance_max = u32::try_from(max.0).unwrap_or(u32::MAX);
+        self
     }
 
     pub fn is_empty(&self) -> bool {
@@ -214,6 +243,7 @@ impl ReceiveBuffer {
 
     pub fn clear(&mut self) {
         self.buffer.clear();
+        self.fresh_from = None;
     }
 
     pub fn synchronize_clock(
@@ -256,7 +286,7 @@ impl ReceiveBuffer {
     ) -> Result<DataPacketAction, DataPacketError> {
         use std::cmp::Ordering::*;
         match data.seq_number.cmp(&self.next_packet_dsn()) {
-            Equal => self.append_next(data),
+            Equal => self.append_next(now, data),
             Greater => self.append_with_loss(now, data),
             Less => self.recover_data(data),
         }
@@ -338,6 +368,7 @@ impl ReceiveBuffer {
                 // increment k and change feedback time, returning sequence numbers
                 lost.k += 1;
                 lost.feedback_time = now;
+                lost.fresh_until = None;
                 lost.data_sequence_number
             });
 
@@ -363,18 +394,30 @@ impl ReceiveBuffer {
             .map(|d| self.remote_clock.instant_from(d.timestamp) + self.tsbpd_latency)
     }
 
-    fn append_next(&mut self, data: DataPacket) -> Result<DataPacketAction, DataPacketError> {
+    fn append_next(
+        &mut self,
+        now: Instant,
+        data: DataPacket,
+    ) -> Result<DataPacketAction, DataPacketError> {
         if self.buffer_available() == 0 {
             Err(DataPacketError::BufferFull {
                 seq_number: data.seq_number,
                 buffer_size: self.buffer.len(),
             })
         } else {
+            let seq_number = data.seq_number;
             self.append_data(data);
-            Ok(DataPacketAction::Received {
-                lrsn: self.lrsn,
-                recovered: false,
-            })
+            self.decay_reorder_tolerance();
+            let expired = self.expire_fresh_losses(now, seq_number);
+            Ok(
+                match CompressedLossList::try_from_iter(expired.into_iter()) {
+                    Some(loss_list) => DataPacketAction::ReceivedWithLoss(loss_list),
+                    None => DataPacketAction::Received {
+                        lrsn: self.lrsn,
+                        recovered: false,
+                    },
+                },
+            )
         }
     }
 
@@ -397,9 +440,28 @@ impl ReceiveBuffer {
                 buffer_required,
             })
         } else {
-            self.append_lost_packets(now, &lost);
+            // Older gaps whose tolerance ran out with this packet are reported too.
+            let mut report = self.expire_fresh_losses(now, seq_number);
+            let fresh_until =
+                (self.reorder_tolerance > 0).then(|| seq_number + self.reorder_tolerance);
+            self.append_lost_packets(now, &lost, fresh_until);
             self.append_data(data);
-            Ok(DataPacketAction::ReceivedWithLoss(lost.into()))
+
+            let loss_list = if fresh_until.is_some() {
+                CompressedLossList::try_from_iter(report.into_iter())
+            } else if report.is_empty() {
+                Some(lost.into())
+            } else {
+                report.extend((0..lost_count).map(|i| lost.start + i));
+                CompressedLossList::try_from_iter(report.into_iter())
+            };
+            Ok(match loss_list {
+                Some(loss_list) => DataPacketAction::ReceivedWithLoss(loss_list),
+                None => DataPacketAction::Received {
+                    lrsn: self.lrsn,
+                    recovered: false,
+                },
+            })
         }
     }
 
@@ -412,7 +474,15 @@ impl ReceiveBuffer {
                 seq_number_0: self.seqno0,
             })?;
 
+        let retransmitted = data.retransmitted;
         self.buffer.get_mut(index).unwrap().update_data(data)?;
+
+        // An original (not retransmitted) packet that turns up behind a
+        // newer one was reordered, not lost: tolerate that much next time.
+        if !retransmitted {
+            let distance = self.next_packet_dsn() - seq_number - 1;
+            self.grow_reorder_tolerance(distance);
+        }
 
         // first lost packet was recovered, update LRSN
         if self.lrsn == seq_number {
@@ -432,11 +502,66 @@ impl ReceiveBuffer {
         self.buffer.push_back(BufferPacket::Received(data));
     }
 
-    fn append_lost_packets(&mut self, now: Instant, lost: &Range<SeqNumber>) {
+    fn append_lost_packets(
+        &mut self,
+        now: Instant,
+        lost: &Range<SeqNumber>,
+        fresh_until: Option<SeqNumber>,
+    ) {
         let lost_count = lost.end - lost.start;
         for i in 0..lost_count {
-            let loss = LostPacket::new(lost.start + i, now);
+            let mut loss = LostPacket::new(lost.start + i, now);
+            loss.fresh_until = fresh_until;
             self.buffer.push_back(BufferPacket::Lost(loss));
+        }
+        if fresh_until.is_some() && lost_count > 0 {
+            self.fresh_from.get_or_insert(lost.start);
+        }
+    }
+
+    /// Takes the lost packets whose reorder tolerance has run out now that
+    /// `highest` has arrived; they are due a loss report.
+    fn expire_fresh_losses(&mut self, now: Instant, highest: SeqNumber) -> Vec<SeqNumber> {
+        let Some(from) = self.fresh_from else {
+            return vec![];
+        };
+        let start = self.clamped_index_for_seqno(from);
+        let mut expired = vec![];
+        let mut still_fresh = None;
+        for packet in self.buffer.range_mut(start..) {
+            if let BufferPacket::Lost(lost) = packet {
+                match lost.fresh_until {
+                    Some(until) if highest < until => {
+                        still_fresh.get_or_insert(lost.data_sequence_number);
+                    }
+                    Some(_) => {
+                        lost.fresh_until = None;
+                        lost.feedback_time = now;
+                        expired.push(lost.data_sequence_number);
+                    }
+                    None => {}
+                }
+            }
+        }
+        self.fresh_from = still_fresh;
+        expired
+    }
+
+    fn grow_reorder_tolerance(&mut self, distance: u32) {
+        self.in_order_run = 0;
+        if distance > self.reorder_tolerance {
+            self.reorder_tolerance = min(distance, self.reorder_tolerance_max);
+        }
+    }
+
+    fn decay_reorder_tolerance(&mut self) {
+        if self.reorder_tolerance == 0 {
+            return;
+        }
+        self.in_order_run += 1;
+        if self.in_order_run >= REORDER_DECAY_PACKETS {
+            self.reorder_tolerance -= 1;
+            self.in_order_run = 0;
         }
     }
 
@@ -1200,5 +1325,153 @@ mod receive_buffer {
             None
         );
         assert_eq!(buf.rx_acknowledged_time(), Duration::from_micros(0));
+    }
+
+    mod reorder_tolerance {
+        use pretty_assertions::assert_eq;
+
+        use super::*;
+
+        fn buffer(max: u64) -> (ReceiveBuffer, Instant) {
+            let start = Instant::now();
+            let buf = ReceiveBuffer::new(
+                start,
+                Duration::from_secs(2),
+                true,
+                SeqNumber(0),
+                PacketCount(8192),
+            )
+            .with_reorder_tolerance_max(PacketCount(max));
+            (buf, start)
+        }
+
+        fn push(
+            buf: &mut ReceiveBuffer,
+            now: Instant,
+            seq: u32,
+            retransmitted: bool,
+        ) -> Option<Vec<u32>> {
+            let data = DataPacket {
+                seq_number: SeqNumber(seq),
+                retransmitted,
+                ..basic_pack()
+            };
+            match buf.push_packet(now, data).unwrap() {
+                ReceivedWithLoss(list) => {
+                    Some(list.into_iter_decompressed().map(|s| s.as_raw()).collect())
+                }
+                _ => None,
+            }
+        }
+
+        /// Packets 0, 2, 1: the gap at 1 is reported at once, then turns out
+        /// to be reordering, so the tolerance becomes 1. Next expected: 3.
+        fn taught_one(max: u64) -> (ReceiveBuffer, Instant) {
+            let (mut buf, now) = buffer(max);
+            assert_eq!(push(&mut buf, now, 0, false), None);
+            assert_eq!(push(&mut buf, now, 2, false), Some(vec![1]));
+            assert_eq!(push(&mut buf, now, 1, false), None);
+            (buf, now)
+        }
+
+        #[test]
+        fn off_reports_every_gap_at_once() {
+            let (mut buf, now) = taught_one(0);
+            assert_eq!(push(&mut buf, now, 3, false), None);
+            assert_eq!(push(&mut buf, now, 5, false), Some(vec![4]));
+        }
+
+        #[test]
+        fn a_reordered_packet_is_never_reported() {
+            let (mut buf, now) = taught_one(200);
+            assert_eq!(push(&mut buf, now, 3, false), None);
+            assert_eq!(
+                push(&mut buf, now, 5, false),
+                None,
+                "the gap at 4 waits out the tolerance"
+            );
+            assert_eq!(push(&mut buf, now, 4, false), None);
+            assert_eq!(push(&mut buf, now, 6, false), None);
+            assert!(buf
+                .prepare_loss_list(now + Duration::from_secs(10), TimeSpan::from_micros(1000))
+                .is_none());
+        }
+
+        #[test]
+        fn real_loss_is_reported_when_the_tolerance_runs_out() {
+            let (mut buf, now) = taught_one(200);
+            assert_eq!(push(&mut buf, now, 3, false), None);
+            assert_eq!(push(&mut buf, now, 5, false), None);
+            assert_eq!(
+                push(&mut buf, now, 6, false),
+                Some(vec![4]),
+                "one packet followed the gap"
+            );
+        }
+
+        #[test]
+        fn a_packet_that_opens_a_gap_also_reports_an_older_one() {
+            let (mut buf, now) = taught_one(200);
+            assert_eq!(push(&mut buf, now, 4, false), None); // gap at 3, until 5
+            assert_eq!(push(&mut buf, now, 6, false), Some(vec![3])); // 3 is out of tolerance; new gap at 5, until 7
+            assert_eq!(push(&mut buf, now, 8, false), Some(vec![5])); // 5 is out; new gap at 7, until 9
+        }
+
+        #[test]
+        fn tolerance_stops_at_the_maximum() {
+            let (mut buf, now) = buffer(3);
+            assert_eq!(push(&mut buf, now, 0, false), None);
+            assert_eq!(push(&mut buf, now, 10, false), Some((1..10).collect()));
+            assert_eq!(push(&mut buf, now, 1, false), None); // 9 packets late, capped at 3
+            assert_eq!(push(&mut buf, now, 11, false), None);
+            assert_eq!(push(&mut buf, now, 13, false), None); // gap at 12, until 16
+            assert_eq!(push(&mut buf, now, 14, false), None);
+            assert_eq!(push(&mut buf, now, 15, false), None);
+            assert_eq!(push(&mut buf, now, 16, false), Some(vec![12]));
+        }
+
+        #[test]
+        fn a_retransmission_teaches_nothing() {
+            let (mut buf, now) = buffer(200);
+            assert_eq!(push(&mut buf, now, 0, false), None);
+            assert_eq!(push(&mut buf, now, 2, false), Some(vec![1]));
+            assert_eq!(push(&mut buf, now, 1, true), None);
+            assert_eq!(push(&mut buf, now, 3, false), None);
+            assert_eq!(push(&mut buf, now, 5, false), Some(vec![4]));
+        }
+
+        #[test]
+        fn the_tolerance_shrinks_while_the_stream_is_in_order() {
+            let (mut buf, now) = taught_one(200);
+            for seq in 3..53 {
+                assert_eq!(push(&mut buf, now, seq, false), None);
+            }
+            assert_eq!(
+                push(&mut buf, now, 54, false),
+                Some(vec![53]),
+                "50 in-order packets cost one step"
+            );
+        }
+
+        #[test]
+        fn the_timer_reports_a_gap_that_is_still_waiting() {
+            let (mut buf, now) = taught_one(200);
+            assert_eq!(push(&mut buf, now, 3, false), None);
+            assert_eq!(push(&mut buf, now, 5, false), None); // gap at 4; no more packets follow
+            let list = buf
+                .prepare_loss_list(now + Duration::from_secs(1), TimeSpan::from_micros(1000))
+                .unwrap();
+            assert_eq!(
+                list.into_iter_decompressed()
+                    .map(|s| s.as_raw())
+                    .collect::<Vec<_>>(),
+                vec![4]
+            );
+            assert_eq!(
+                push(&mut buf, now, 6, false),
+                None,
+                "already reported, so not again"
+            );
+        }
     }
 }
