@@ -69,7 +69,9 @@ pub fn gen_access_control_response(
         // ok, both sides have crypto
         (Some(key_settings), Some(SrtControlPacket::KeyRefreshRequest(km))) => {
             if key_settings.key_size != incoming.key_size {
-                unimplemented!("Key size mismatch");
+                return GenHsv5Result::Reject(ConnectionReject::Rejecting(
+                    CoreRejectReason::BadSecret.into(),
+                ));
             }
 
             let cipher = match CipherSettings::new(key_settings, &settings.key_refresh, km) {
@@ -85,13 +87,21 @@ pub fn gen_access_control_response(
         // ok, neither have crypto
         (None, None) => None,
         // bad cases
-        (Some(_), Some(_)) => unimplemented!("Expected kmreq"),
+        (Some(_), Some(_)) => {
+            return GenHsv5Result::Reject(ConnectionReject::Rejecting(
+                CoreRejectReason::BadSecret.into(),
+            ))
+        }
         (Some(_), None) => {
             return GenHsv5Result::Reject(ConnectionReject::Rejecting(
                 CoreRejectReason::Unsecure.into(),
             ))
         }
-        (None, Some(_)) => unimplemented!("expected no secrets"),
+        (None, Some(_)) => {
+            return GenHsv5Result::Reject(ConnectionReject::Rejecting(
+                CoreRejectReason::Unsecure.into(),
+            ))
+        }
     };
 
     let outgoing_ext_km = cipher

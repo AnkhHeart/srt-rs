@@ -270,7 +270,12 @@ impl Listen {
         );
         let (hsv5, settings) = match response {
             GenHsv5Result::Accept(h, c) => (h, c),
-            GenHsv5Result::NotHandled(e) => return NotHandled(e),
+            // the caller is waiting for a response to this conclusion, so a malformed
+            // handshake is rejected rather than left pending
+            GenHsv5Result::NotHandled(_) => {
+                let r = ConnectionReject::Rejecting(CoreRejectReason::Rogue.into());
+                return self.make_rejection(&shake, state.from, timestamp, r);
+            }
             GenHsv5Result::Reject(r) => {
                 return self.make_rejection(&shake, state.from, timestamp, r);
             }
@@ -541,7 +546,101 @@ mod test {
 
         let resp = l.handle_packet(Instant::now(), Ok((build_hs_pack(c), conn_addr())));
 
-        assert_matches!(resp, NotHandled(ConnectError::ExpectedExtFlags));
+        assert_matches!(
+            resp,
+            Reject(
+                Some(_),
+                ConnectionReject::Rejecting(RejectReason::Core(CoreRejectReason::Rogue))
+            )
+        );
+    }
+
+    fn test_key_material() -> SrtControlPacket {
+        SrtControlPacket::KeyRefreshRequest(KeyingMaterialMessage {
+            pt: PacketType::KeyingMaterial,
+            key_flags: KeyFlags::EVEN,
+            keki: 0,
+            cipher: CipherType::Ctr,
+            auth: Auth::None,
+            salt: vec![0; 16],
+            wrapped_keys: vec![0; 24],
+        })
+    }
+
+    #[test]
+    fn send_key_material_without_passphrase() {
+        let mut l = test_listen();
+
+        let resp = l.handle_packet(
+            Instant::now(),
+            Ok((build_hs_pack(test_induction()), conn_addr())),
+        );
+        assert_matches!(resp, SendPacket(_));
+
+        let mut c = test_conclusion();
+        if let HandshakeVsInfo::V5(info) = &mut c.info {
+            info.key_size = KeySize::AES128;
+            info.ext_km = Some(test_key_material());
+        }
+
+        let resp = l.handle_packet(Instant::now(), Ok((build_hs_pack(c), conn_addr())));
+
+        assert_matches!(
+            resp,
+            Reject(
+                Some(_),
+                ConnectionReject::Rejecting(RejectReason::Core(CoreRejectReason::Unsecure))
+            )
+        );
+    }
+
+    #[test]
+    fn send_mismatched_key_material_with_passphrase() {
+        for (key_size, ext_km) in [
+            // key size differs from the listener's
+            (KeySize::AES256, test_key_material()),
+            // not a key material request
+            (
+                KeySize::AES128,
+                match test_key_material() {
+                    SrtControlPacket::KeyRefreshRequest(km) => {
+                        SrtControlPacket::KeyRefreshResponse(km)
+                    }
+                    _ => unreachable!(),
+                },
+            ),
+        ] {
+            let settings = ConnInitSettings {
+                key_settings: Some(KeySettings {
+                    key_size: KeySize::AES128,
+                    passphrase: "super secret passcode".into(),
+                }),
+                ..Default::default()
+            };
+            let mut l = Listen::new(settings, false);
+
+            let resp = l.handle_packet(
+                Instant::now(),
+                Ok((build_hs_pack(test_induction()), conn_addr())),
+            );
+            assert_matches!(resp, SendPacket(_));
+
+            let mut c = test_conclusion();
+            if let HandshakeVsInfo::V5(info) = &mut c.info {
+                info.key_size = key_size;
+                info.ext_km = Some(ext_km);
+            }
+
+            let resp = l.handle_packet(Instant::now(), Ok((build_hs_pack(c), conn_addr())));
+
+            assert_matches!(
+                resp,
+                Reject(
+                    Some(_),
+                    ConnectionReject::Rejecting(RejectReason::Core(CoreRejectReason::BadSecret))
+                )
+            );
+        }
     }
 
     #[test]
