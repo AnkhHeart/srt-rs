@@ -948,8 +948,10 @@ impl Debug for CompressedLossList {
         let mut iter = self.0.iter();
         while let Some(a) = iter.next() {
             if a & 0x80000000 != 0 {
-                let b = iter.next().expect("Unterminated list");
-                write!(f, "{}..={},", a & 0x7fffffff, b)?;
+                match iter.next() {
+                    Some(b) => write!(f, "{}..={},", a & 0x7fffffff, b)?,
+                    None => write!(f, "{}..,", a & 0x7fffffff)?,
+                }
             } else {
                 write!(f, "{a},")?;
             }
@@ -1880,6 +1882,12 @@ mod test {
 
     #[test]
     fn drop_request() {}
+
+    #[test]
+    fn unterminated_loss_list_debug() {
+        let list = CompressedLossList(vec![1 << 31 | 10]);
+        assert_eq!(format!("{list:?}"), "10..,");
+    }
 
     fn nak_packet(loss_list: &[u32]) -> Vec<u8> {
         let mut data = vec![0x80, 0x03];
