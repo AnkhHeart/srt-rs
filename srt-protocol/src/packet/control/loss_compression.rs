@@ -88,10 +88,42 @@ where
     }
 }
 
+/// The longest range of sequence numbers a single compressed loss entry may describe.
+/// Larger ranges (and ranges whose end precedes their start) are invalid.
+pub const MAX_LOSS_RANGE: u32 = 1 << 20;
+
+const RANGE_START: u32 = 1 << 31;
+
+/// Returns the inclusive end of a compressed range starting at `start`, if it is valid
+fn range_end(start: SeqNumber, end: u32) -> Option<SeqNumber> {
+    if end & RANGE_START != 0 {
+        return None;
+    }
+    let end = SeqNumber::new_truncate(end);
+    // the distance is measured modularly, so an end before the start is a very large distance
+    (end - start < MAX_LOSS_RANGE).then_some(end)
+}
+
+/// Checks that every range in a compressed loss list is terminated, does not end before
+/// it starts, and is of a reasonable size
+pub fn is_valid_loss_list(loss_list: &[u32]) -> bool {
+    let mut iter = loss_list.iter().copied();
+    while let Some(next) = iter.next() {
+        if next & RANGE_START != 0 {
+            let start = SeqNumber::new_truncate(next & !RANGE_START);
+            match iter.next() {
+                Some(end) if range_end(start, end).is_some() => {}
+                _ => return false,
+            }
+        }
+    }
+    true
+}
+
 pub struct DecompressLossList<I> {
     iterator: I,
 
-    loop_next_end: Option<(u32, u32)>,
+    loop_next_end: Option<(SeqNumber, SeqNumber)>,
 }
 
 impl<I: Iterator<Item = u32>> Iterator for DecompressLossList<I> {
@@ -103,31 +135,27 @@ impl<I: Iterator<Item = u32>> Iterator for DecompressLossList<I> {
                 // loop is over
                 self.loop_next_end = None;
 
-                Some(SeqNumber::new_truncate(next))
+                Some(next)
             }
             Some((next, end)) => {
                 // continue the loop
                 self.loop_next_end = Some((next + 1, end));
 
-                Some(SeqNumber::new_truncate(next))
+                Some(next)
             }
             None => {
                 // no current loop
                 let next = self.iterator.next()?;
 
                 // is this a loop start
-                if next & (1 << 31) != 0 {
+                if next & RANGE_START != 0 {
                     // set the first bit to zero
-                    let next_num = next & !(1 << 31);
-                    self.loop_next_end = Some((
-                        next_num + 1,
-                        match self.iterator.next() {
-                            Some(i) => i,
-                            None => panic!("unterminated loop while decompressing loss list"),
-                        },
-                    ));
+                    let next_num = SeqNumber::new_truncate(next & !RANGE_START);
+                    // an unterminated or invalid range ends the list
+                    let end = range_end(next_num, self.iterator.next()?)?;
+                    self.loop_next_end = Some((next_num + 1, end));
 
-                    Some(SeqNumber::new_truncate(next_num))
+                    Some(next_num)
                 } else {
                     // no looping is possible
                     Some(SeqNumber::new_truncate(next))
@@ -194,8 +222,40 @@ mod test {
     }
 
     #[test]
-    #[should_panic(expected = "unterminated loop")]
     fn unterminated_loop() {
-        let _ = decompress_loss_list([10 | ONE].iter().copied()).collect::<Vec<_>>();
+        assert!(decompress_loss_list([10 | ONE].iter().copied())
+            .next()
+            .is_none());
+        assert!(!is_valid_loss_list(&[10 | ONE]));
+    }
+
+    #[test]
+    fn reversed_range() {
+        // an end before the start must not expand to a huge range
+        assert_eq!(
+            decompress_loss_list([100 | ONE, 10].iter().copied()).count(),
+            0
+        );
+        assert!(!is_valid_loss_list(&[100 | ONE, 10]));
+    }
+
+    #[test]
+    fn oversized_range() {
+        assert!(!is_valid_loss_list(&[0 | ONE, MAX_LOSS_RANGE]));
+        assert!(!is_valid_loss_list(&[0 | ONE, ONE]));
+        assert_eq!(
+            decompress_loss_list([0 | ONE, MAX_LOSS_RANGE].iter().copied()).count(),
+            0
+        );
+        assert!(is_valid_loss_list(&[0 | ONE, MAX_LOSS_RANGE - 1]));
+    }
+
+    #[test]
+    fn wrapping_range() {
+        let max = SeqNumber::MAX - 1;
+        assert_eq!(
+            decompress_loss_list([(max - 1) | ONE, 1].iter().copied()).collect::<Vec<_>>(),
+            [max - 1, max, 0, 1].map(SeqNumber::new_truncate)
+        );
     }
 }

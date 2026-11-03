@@ -120,9 +120,15 @@ pub struct OpenConnection {
 }
 
 impl OpenConnection {
+    /// Hands a packet to the connection without waiting. The listener is shared by every
+    /// connection, so a connection that is not keeping up must not stall it; its
+    /// packets are dropped instead.
     pub async fn send(&mut self, packet: (Packet, SocketAddr)) -> Result<(), ()> {
         match self.packet_sender.try_send(Ok(packet)) {
-            Err(e) if e.is_full() => self.packet_sender.send(e.into_inner()).await.ok().ok_or(()),
+            Err(e) if e.is_full() => {
+                log::debug!("connection queue full, dropping packet");
+                Ok(())
+            }
             r => r.ok().ok_or(()),
         }
     }
@@ -141,5 +147,38 @@ impl ResponseSender {
             .send((self.0, response))
             .await
             .map_err(|e| std::io::Error::new(ErrorKind::NotConnected, e))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn send_does_not_block_when_full() {
+        let (packet_sender, mut receiver) = mpsc::channel(1);
+        let mut connection = OpenConnection { packet_sender };
+        let addr: SocketAddr = "127.0.0.1:2000".parse().unwrap();
+        let packet = Packet::Control(ControlPacket {
+            timestamp: TimeStamp::from_micros(0),
+            dest_sockid: SocketId(1),
+            control_type: ControlTypes::KeepAlive,
+        });
+
+        // nothing is reading from the receiver, so the channel fills up
+        for _ in 0..10 {
+            let result = tokio::time::timeout(
+                Duration::from_secs(1),
+                connection.send((packet.clone(), addr)),
+            )
+            .await;
+            assert_eq!(result, Ok(Ok(())));
+        }
+
+        // a closed channel is still reported
+        receiver.close();
+        assert_eq!(connection.send((packet, addr)).await, Err(()));
     }
 }

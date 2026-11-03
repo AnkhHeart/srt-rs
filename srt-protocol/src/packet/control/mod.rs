@@ -24,7 +24,7 @@ use crate::{
 
 use super::*;
 
-use loss_compression::{compress_loss_list, decompress_loss_list};
+use loss_compression::{compress_loss_list, decompress_loss_list, is_valid_loss_list};
 
 /// A UDP packet carrying control information
 ///
@@ -731,6 +731,10 @@ impl ControlTypes {
                 let mut loss_info = Vec::new();
                 while buf.remaining() >= 4 {
                     loss_info.push(buf.get_u32());
+                }
+
+                if !is_valid_loss_list(&loss_info) {
+                    return Err(PacketParseError::BadLossList);
                 }
 
                 Ok(ControlTypes::Nak(CompressedLossList(loss_info)))
@@ -1876,6 +1880,40 @@ mod test {
 
     #[test]
     fn drop_request() {}
+
+    fn nak_packet(loss_list: &[u32]) -> Vec<u8> {
+        let mut data = vec![0x80, 0x03];
+        data.extend([0u8; 14]);
+        data.extend(loss_list.iter().flat_map(|l| l.to_be_bytes()));
+        data
+    }
+
+    #[test]
+    fn nak_with_invalid_range_is_rejected() {
+        let start = 1u32 << 31;
+        for loss_list in [
+            // end before start
+            vec![start | 100, 10],
+            // unterminated
+            vec![start | 100],
+            // too large
+            vec![start, 1 << 30],
+            // end has the range bit set
+            vec![start | 5, start | 10],
+        ] {
+            let data = nak_packet(&loss_list);
+            assert!(
+                matches!(
+                    Packet::parse(&mut Cursor::new(&data), false),
+                    Err(PacketParseError::BadLossList)
+                ),
+                "{loss_list:?}"
+            );
+        }
+
+        let data = nak_packet(&[(1 << 31) | 10, 100, 200]);
+        assert!(Packet::parse(&mut Cursor::new(&data), false).is_ok());
+    }
 
     #[test]
     fn malformed_srt_extension_does_not_panic() {

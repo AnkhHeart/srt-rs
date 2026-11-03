@@ -21,6 +21,7 @@ pub enum PacketParseError {
     StreamTypeNotUtf8(Utf8Error),
     ZeroAckSequenceNumber,
     BadFilter(String),
+    BadLossList,
 }
 
 impl fmt::Display for PacketParseError {
