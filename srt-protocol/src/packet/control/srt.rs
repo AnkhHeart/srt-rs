@@ -272,7 +272,7 @@ bitflags! {
 }
 
 fn le_bytes_to_string(le_bytes: &mut impl Buf) -> Result<String, PacketParseError> {
-    if le_bytes.remaining() % 4 != 0 {
+    if le_bytes.remaining() == 0 || le_bytes.remaining() % 4 != 0 {
         return Err(PacketParseError::NotEnoughData);
     }
 
@@ -365,6 +365,9 @@ impl SrtControlPacket {
                 )))
             }
             8 => {
+                if buf.remaining() < 4 {
+                    return Err(PacketParseError::NotEnoughData);
+                }
                 let ty = buf.get_u8().into();
                 let flags = GroupFlags::from_bits_truncate(buf.get_u8());
                 let weight = buf.get_u16_le();

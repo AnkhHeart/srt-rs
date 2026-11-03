@@ -632,7 +632,11 @@ impl ControlTypes {
                                             SrtControlPacket::StreamId(stream_id) => {
                                                 sid = Some(stream_id)
                                             }
-                                            _ => unimplemented!("Implement other kinds"),
+                                            // congestion, filter, and group extensions are not supported
+                                            other => warn!(
+                                                "Ignoring unsupported handshake extension {:?}",
+                                                other
+                                            ),
                                         }
                                     }
                                 }
@@ -1872,4 +1876,53 @@ mod test {
 
     #[test]
     fn drop_request() {}
+
+    #[test]
+    fn malformed_srt_extension_does_not_panic() {
+        // ext types 5 (stream id) and 8 (group) with an empty body, and the reserved
+        // types 6 and 7
+        for ext_type in [5u8, 6, 7, 8] {
+            let mut data = vec![0xFF, 0xFF, 0x00, ext_type];
+            data.extend([0u8; 12]);
+            assert!(Packet::parse(&mut Cursor::new(&data), false).is_err());
+        }
+    }
+
+    fn conclusion_with_extension(ext_type: u16, body: &[u8]) -> Vec<u8> {
+        let mut data = vec![];
+        data.extend(0x8000_0000u32.to_be_bytes()); // handshake
+        data.extend([0u8; 4]); // additional info
+        data.extend([0u8; 4]); // timestamp
+        data.extend([0u8; 4]); // dest socket id
+        data.extend(5i32.to_be_bytes()); // udt version
+        data.extend([0u8, 0, 0, 4]); // no encryption, CONFIG extension flag
+        data.extend([0u8; 4]); // initial sequence number
+        data.extend(1500u32.to_be_bytes());
+        data.extend(8192u32.to_be_bytes());
+        data.extend((-1i32).to_be_bytes()); // conclusion
+        data.extend(1u32.to_be_bytes()); // socket id
+        data.extend([0u8; 4]); // cookie
+        data.extend([0u8; 16]); // peer address
+        data.extend(ext_type.to_be_bytes());
+        data.extend((body.len() as u16 / 4).to_be_bytes());
+        data.extend(body);
+        // trailing word, so the extension is not mistaken for the end of the packet
+        data.extend([0u8; 4]);
+        data
+    }
+
+    #[test]
+    fn handshake_with_empty_stream_id_extension() {
+        let data = conclusion_with_extension(5, &[]);
+        assert!(Packet::parse(&mut Cursor::new(&data), false).is_err());
+    }
+
+    #[test]
+    fn handshake_with_unsupported_extensions() {
+        for ext_type in [6u16, 7, 8] {
+            let data = conclusion_with_extension(ext_type, &[0, 0, 0, 0]);
+            // must not panic
+            let _ = Packet::parse(&mut Cursor::new(&data), false);
+        }
+    }
 }
