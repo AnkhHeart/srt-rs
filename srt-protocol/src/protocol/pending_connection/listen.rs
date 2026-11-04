@@ -95,6 +95,10 @@ impl Listen {
         }
     }
 
+    pub fn is_access_requested(&self) -> bool {
+        matches!(self.state, AccessControlRequested(..))
+    }
+
     pub fn handle_timer(&self, _now: Instant) -> ConnectionResult {
         NoAction
     }

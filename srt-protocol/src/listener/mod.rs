@@ -2,7 +2,13 @@ mod input;
 mod session;
 mod statistics;
 
-use std::{collections::HashMap, fmt::Debug, net::SocketAddr, time::Duration, time::Instant};
+use std::{
+    collections::{hash_map::Entry, HashMap},
+    fmt::Debug,
+    net::{IpAddr, SocketAddr},
+    time::Duration,
+    time::Instant,
+};
 
 use crate::{packet::*, protocol::time::Timer, settings::ConnInitSettings};
 
@@ -14,12 +20,62 @@ pub use statistics::*;
 #[derive(Clone, Debug)]
 pub struct ListenerSettings {}
 
+/// How long a session that has not been opened may go without a packet before it is discarded
+const PENDING_SESSION_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The most sessions that have not been opened, in total
+const MAX_PENDING_SESSIONS: usize = 4096;
+
+/// The most sessions that have not been opened for a single remote IP address
+const MAX_PENDING_SESSIONS_PER_IP: usize = 16;
+
+#[derive(Debug)]
+struct Session {
+    state: SessionState,
+    last_activity: Instant,
+    /// Whether the session counts against the limits on sessions that are not open
+    pending: bool,
+}
+
+/// Tracks the sessions that are not yet open
+#[derive(Debug, Default)]
+struct PendingCount {
+    total: usize,
+    per_ip: HashMap<IpAddr, usize>,
+}
+
+impl PendingCount {
+    fn try_add(&mut self, ip: IpAddr) -> bool {
+        let count = self.per_ip.entry(ip).or_default();
+        if self.total >= MAX_PENDING_SESSIONS || *count >= MAX_PENDING_SESSIONS_PER_IP {
+            if *count == 0 {
+                self.per_ip.remove(&ip);
+            }
+            return false;
+        }
+        *count += 1;
+        self.total += 1;
+        true
+    }
+
+    fn release(&mut self, ip: IpAddr) {
+        self.total = self.total.saturating_sub(1);
+        if let Entry::Occupied(mut count) = self.per_ip.entry(ip) {
+            *count.get_mut() -= 1;
+            if *count.get() == 0 {
+                count.remove();
+            }
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct MultiplexListener {
     start_time: Instant,
     local_address: SocketAddr,
     settings: ConnInitSettings,
-    sessions: HashMap<SessionId, SessionState>,
+    sessions: HashMap<SessionId, Session>,
+    pending: PendingCount,
     stats: ListenerStatistics,
     stats_timer: Timer,
 }
@@ -31,6 +87,7 @@ impl MultiplexListener {
             local_address,
             settings,
             sessions: Default::default(),
+            pending: Default::default(),
             stats: Default::default(),
             stats_timer: Timer::new(now, Duration::from_secs(1)),
         }
@@ -70,11 +127,77 @@ impl MultiplexListener {
         self.stats.rx_packets += 1;
         //self.stats.rx_bytes += packet
         let session_id = SessionId(packet.1);
-        let settings = &self.settings;
-        self.sessions
-            .entry(session_id)
-            .or_insert_with(|| SessionState::new_pending(settings.copy_randomize()))
-            .handle_packet(now, session_id, packet)
+        let session = match self.sessions.entry(session_id) {
+            Entry::Occupied(session) => session.into_mut(),
+            Entry::Vacant(session) => {
+                if !self.pending.try_add(packet.1.ip()) {
+                    // too many sessions are waiting to be opened, ignore the packet
+                    return Action::WaitForInput;
+                }
+                session.insert(Session {
+                    state: SessionState::new_pending(self.settings.copy_randomize()),
+                    last_activity: now,
+                    pending: true,
+                })
+            }
+        };
+        session.last_activity = now;
+        let action = session.state.handle_packet(now, session_id, packet);
+        self.update_pending(&session_id);
+        action
+    }
+
+    /// Stops counting a session against the pending limits once it is open
+    fn update_pending(&mut self, session_id: &SessionId) {
+        if let Some(session) = self.sessions.get_mut(session_id) {
+            if session.pending && session.state.is_open() {
+                session.pending = false;
+                self.pending.release(session_id.0.ip());
+            }
+        }
+    }
+
+    fn remove_session(&mut self, session_id: &SessionId) {
+        if let Some(session) = self.sessions.remove(session_id) {
+            if session.pending {
+                self.pending.release(session_id.0.ip());
+            }
+        }
+    }
+
+    /// Discards sessions that have gone quiet. Sessions that hold resources outside of the
+    /// listener are returned, one at a time, so that the I/O loop can release them.
+    fn expire_sessions(&mut self, now: Instant) -> Option<SessionId> {
+        // a connection that is open closes itself after the peer idle timeout
+        let open_timeout = self.settings.peer_idle_timeout.saturating_mul(2);
+        let expired: Vec<SessionId> = self
+            .sessions
+            .iter()
+            .filter(|(_, session)| {
+                let timeout = if session.state.is_open() {
+                    open_timeout
+                } else {
+                    PENDING_SESSION_TIMEOUT
+                };
+                now.duration_since(session.last_activity) > timeout
+            })
+            .map(|(session_id, _)| *session_id)
+            .collect();
+
+        let mut to_drop = None;
+        for session_id in expired {
+            let holds_resources = self.sessions.get(&session_id).is_some_and(|session| {
+                session.state.is_open() || session.state.is_awaiting_access()
+            });
+            if holds_resources && to_drop.is_some() {
+                continue;
+            }
+            self.remove_session(&session_id);
+            if holds_resources {
+                to_drop = Some(session_id);
+            }
+        }
+        to_drop
     }
 
     fn handle_packet_receive_error(&mut self, now: Instant, error: ReceivePacketError) -> Action {
@@ -96,13 +219,22 @@ impl MultiplexListener {
         response: AccessControlResponse,
     ) -> Action {
         match self.sessions.get_mut(&session_id) {
-            Some(session) => session.handle_access_control_response(now, session_id, response),
+            Some(session) => {
+                session.last_activity = now;
+                let action = session
+                    .state
+                    .handle_access_control_response(now, session_id, response);
+                self.update_pending(&session_id);
+                action
+            }
             None => Action::DropConnection(session_id),
         }
     }
 
     fn handle_timer(&mut self, now: Instant) -> Action {
-        if self.stats_timer.check_expired(now).is_some() {
+        if let Some(session_id) = self.expire_sessions(now) {
+            Action::DropConnection(session_id)
+        } else if self.stats_timer.check_expired(now).is_some() {
             Action::UpdateStatistics(&self.stats)
         } else {
             // TODO: create an action that returns an action with an Iterator that ticks time forward
@@ -122,7 +254,7 @@ impl MultiplexListener {
             }
             RejectConnection(session_id) => {
                 self.stats.cx_rejected += 1;
-                self.sessions.remove(&session_id);
+                self.remove_session(&session_id);
             }
             OpenConnection(_) => {
                 self.stats.cx_opened += 1;
@@ -132,7 +264,7 @@ impl MultiplexListener {
             }
             DropConnection(session_id) => {
                 self.stats.cx_dropped += 1;
-                self.sessions.remove(&session_id);
+                self.remove_session(&session_id);
             }
             UpdateStatistics => {}
         }
@@ -286,12 +418,134 @@ mod test {
 
         let ids: Vec<_> = addrs
             .iter()
-            .map(|addr| match &listener.sessions[&SessionId(*addr)] {
+            .map(|addr| match &listener.sessions[&SessionId(*addr)].state {
                 SessionState::Pending(listen) => listen.settings().local_sockid,
                 state => panic!("unexpected session state {state:?}"),
             })
             .collect();
         assert_ne!(ids[0], ids[1]);
+    }
+
+    fn new_listener(now: Instant) -> MultiplexListener {
+        let local = "0.0.0.0:2000".parse().unwrap();
+        MultiplexListener::new(now, local, ConnInitSettings::default())
+    }
+
+    fn induct(listener: &mut MultiplexListener, now: Instant, addr: SocketAddr) -> Action {
+        let packet = build_hs_pack(test_induction());
+        listener.handle_input(now, Input::Packet(Ok((packet, addr))))
+    }
+
+    fn addr_n(n: usize) -> SocketAddr {
+        let n = n as u32;
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::from(0x0a00_0000 + n)), 8765)
+    }
+
+    #[test]
+    fn pending_sessions_expire() {
+        let start = Instant::now();
+        let mut listener = new_listener(start);
+
+        for n in 0..100 {
+            assert_matches!(
+                induct(&mut listener, start, addr_n(n)),
+                Action::SendPacket(_)
+            );
+        }
+        assert_eq!(listener.sessions.len(), 100);
+        assert_eq!(listener.pending.total, 100);
+
+        // still within the timeout
+        listener.handle_input(start + Duration::from_secs(4), Input::Timer);
+        assert_eq!(listener.sessions.len(), 100);
+
+        // a session that sees activity is kept
+        induct(&mut listener, start + Duration::from_secs(4), addr_n(0));
+
+        listener.handle_input(start + Duration::from_secs(6), Input::Timer);
+        assert_eq!(listener.sessions.len(), 1);
+        assert_eq!(listener.pending.total, 1);
+
+        listener.handle_input(start + Duration::from_secs(10), Input::Timer);
+        assert!(listener.sessions.is_empty());
+        assert_eq!(listener.pending.total, 0);
+        assert!(listener.pending.per_ip.is_empty());
+    }
+
+    #[test]
+    fn pending_sessions_are_limited_per_ip() {
+        let start = Instant::now();
+        let mut listener = new_listener(start);
+
+        for port in 0..MAX_PENDING_SESSIONS_PER_IP + 10 {
+            let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 2000 + port as u16);
+            induct(&mut listener, start, addr);
+        }
+        assert_eq!(listener.sessions.len(), MAX_PENDING_SESSIONS_PER_IP);
+
+        // other addresses are not affected
+        assert_matches!(
+            induct(&mut listener, start, addr_n(1)),
+            Action::SendPacket(_)
+        );
+        assert_eq!(listener.sessions.len(), MAX_PENDING_SESSIONS_PER_IP + 1);
+    }
+
+    #[test]
+    fn pending_sessions_are_limited_in_total() {
+        let start = Instant::now();
+        let mut listener = new_listener(start);
+
+        for n in 0..MAX_PENDING_SESSIONS + 10 {
+            induct(&mut listener, start, addr_n(n));
+        }
+        assert_eq!(listener.sessions.len(), MAX_PENDING_SESSIONS);
+
+        // room is made once sessions expire
+        listener.handle_input(start + Duration::from_secs(6), Input::Timer);
+        assert!(listener.sessions.is_empty());
+        assert_matches!(
+            induct(&mut listener, start + Duration::from_secs(6), addr_n(0)),
+            Action::SendPacket(_)
+        );
+    }
+
+    #[test]
+    fn open_sessions_are_not_pending_and_expire_when_idle() {
+        let start = Instant::now();
+        let mut listener = new_listener(start);
+
+        induct(&mut listener, start, conn_addr());
+        let packet = build_hs_pack(test_conclusion());
+        let action = listener.handle_input(start, Input::Packet(Ok((packet, conn_addr()))));
+        assert_matches!(action, Action::RequestAccess(_, _));
+
+        // a request waiting on the application is released after the timeout
+        let action = listener.handle_input(start + Duration::from_secs(6), Input::Timer);
+        assert_eq!(action, Action::DropConnection(session_id()));
+        assert!(listener.sessions.is_empty());
+        assert_eq!(listener.pending.total, 0);
+
+        induct(&mut listener, start, conn_addr());
+        let packet = build_hs_pack(test_conclusion());
+        listener.handle_input(start, Input::Packet(Ok((packet, conn_addr()))));
+        let action = listener.handle_input(
+            start,
+            Input::AccessResponse(Some((session_id(), AccessControlResponse::Accepted(None)))),
+        );
+        assert_matches!(action, Action::OpenConnection(_, _));
+        assert_eq!(listener.pending.total, 0);
+        assert_eq!(listener.sessions.len(), 1);
+
+        // an open session is kept while the connection is alive, then released
+        let idle = listener.settings.peer_idle_timeout;
+        let action = listener.handle_input(start + idle, Input::Timer);
+        assert_ne!(action, Action::DropConnection(session_id()));
+        assert_eq!(listener.sessions.len(), 1);
+
+        let action = listener.handle_input(start + idle * 3, Input::Timer);
+        assert_eq!(action, Action::DropConnection(session_id()));
+        assert!(listener.sessions.is_empty());
     }
 
     #[test]

@@ -164,6 +164,7 @@ impl SrtListenerState {
     }
 
     async fn drop_connection(&mut self, session_id: SessionId) -> Result<(), ()> {
+        let _ = self.pending_connections.remove(&session_id);
         match self.open_connections.remove(&session_id) {
             Some(mut connection) => connection.close().await,
             None => Ok(()),

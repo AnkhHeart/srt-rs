@@ -23,12 +23,21 @@ impl SessionState {
         SessionState::Pending(Listen::new(settings, true))
     }
 
+    pub fn is_open(&self) -> bool {
+        matches!(self, SessionState::Open)
+    }
+
+    /// Whether the application has been asked to accept or reject this session
+    pub fn is_awaiting_access(&self) -> bool {
+        matches!(self, SessionState::Pending(listen) if listen.is_access_requested())
+    }
+
     pub fn handle_packet(
         &mut self,
         now: Instant,
         session_id: SessionId,
         packet: (Packet, SocketAddr),
-    ) -> Action {
+    ) -> Action<'static> {
         use SessionState::*;
         match self {
             Pending(listen) => {
@@ -46,7 +55,7 @@ impl SessionState {
         now: Instant,
         session_id: SessionId,
         response: AccessControlResponse,
-    ) -> Action {
+    ) -> Action<'static> {
         use SessionState::*;
         match self {
             Pending(listen) => {
@@ -79,7 +88,7 @@ impl SessionState {
         &mut self,
         session_id: SessionId,
         result: ConnectionResult,
-    ) -> Action {
+    ) -> Action<'static> {
         use ConnectionResult::*;
         match result {
             // TODO: do something with the error?
@@ -96,14 +105,18 @@ impl SessionState {
         }
     }
 
-    fn reject(&mut self, session_id: SessionId, packet: Option<(Packet, SocketAddr)>) -> Action {
+    fn reject(
+        &mut self,
+        session_id: SessionId,
+        packet: Option<(Packet, SocketAddr)>,
+    ) -> Action<'static> {
         if !matches!(self, SessionState::Rejecting(_)) {
             *self = SessionState::Rejecting(packet.clone());
         }
         Action::RejectConnection(session_id, packet)
     }
 
-    fn drop(&mut self, session_id: SessionId) -> Action {
+    fn drop(&mut self, session_id: SessionId) -> Action<'static> {
         if !matches!(self, SessionState::Dropping) {
             *self = SessionState::Dropping;
         }
@@ -115,7 +128,7 @@ impl SessionState {
         session_id: SessionId,
         packet: Option<(Packet, SocketAddr)>,
         connection: Connection,
-    ) -> Action {
+    ) -> Action<'static> {
         if !matches!(self, SessionState::Open) {
             *self = SessionState::Open;
         }
