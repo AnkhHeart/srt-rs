@@ -73,7 +73,7 @@ impl MultiplexListener {
         let settings = &self.settings;
         self.sessions
             .entry(session_id)
-            .or_insert_with(|| SessionState::new_pending(settings.clone()))
+            .or_insert_with(|| SessionState::new_pending(settings.copy_randomize()))
             .handle_packet(now, session_id, packet)
     }
 
@@ -268,6 +268,30 @@ mod test {
         let action =
             listener.handle_input(Instant::now(), Input::Packet(Ok((packet, conn_addr()))));
         assert_matches!(action, Action::DelegatePacket(_, _));
+    }
+
+    #[test]
+    fn sessions_get_distinct_local_socket_ids() {
+        let settings = ConnInitSettings::default();
+        let local = "0.0.0.0:2000".parse().unwrap();
+        let mut listener = MultiplexListener::new(Instant::now(), local, settings);
+
+        let addrs: Vec<SocketAddr> = (0..2)
+            .map(|i| SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8765 + i))
+            .collect();
+        for addr in &addrs {
+            let packet = build_hs_pack(test_induction());
+            listener.handle_input(Instant::now(), Input::Packet(Ok((packet, *addr))));
+        }
+
+        let ids: Vec<_> = addrs
+            .iter()
+            .map(|addr| match &listener.sessions[&SessionId(*addr)] {
+                SessionState::Pending(listen) => listen.settings().local_sockid,
+                state => panic!("unexpected session state {state:?}"),
+            })
+            .collect();
+        assert_ne!(ids[0], ids[1]);
     }
 
     #[test]
