@@ -26,7 +26,8 @@ const PENDING_SESSION_TIMEOUT: Duration = Duration::from_secs(5);
 /// The most sessions that have not been opened, in total
 const MAX_PENDING_SESSIONS: usize = 4096;
 
-/// The most sessions that have not been opened for a single remote IP address
+/// The most sessions that have not been opened for a single remote IP address.
+/// Loopback addresses are exempt, as a local relay may forward many callers from one address.
 const MAX_PENDING_SESSIONS_PER_IP: usize = 16;
 
 #[derive(Debug)]
@@ -46,6 +47,13 @@ struct PendingCount {
 
 impl PendingCount {
     fn try_add(&mut self, ip: IpAddr) -> bool {
+        if ip.to_canonical().is_loopback() {
+            if self.total >= MAX_PENDING_SESSIONS {
+                return false;
+            }
+            self.total += 1;
+            return true;
+        }
         let count = self.per_ip.entry(ip).or_default();
         if self.total >= MAX_PENDING_SESSIONS || *count >= MAX_PENDING_SESSIONS_PER_IP {
             if *count == 0 {
@@ -301,7 +309,7 @@ impl MultiplexListener {
 mod test {
     use assert_matches::assert_matches;
     use std::{
-        net::{IpAddr, Ipv4Addr},
+        net::{IpAddr, Ipv4Addr, Ipv6Addr},
         time::Duration,
     };
 
@@ -478,7 +486,7 @@ mod test {
         let mut listener = new_listener(start);
 
         for port in 0..MAX_PENDING_SESSIONS_PER_IP + 10 {
-            let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 2000 + port as u16);
+            let addr = SocketAddr::new(addr_n(0).ip(), 2000 + port as u16);
             induct(&mut listener, start, addr);
         }
         assert_eq!(listener.sessions.len(), MAX_PENDING_SESSIONS_PER_IP);
@@ -489,6 +497,57 @@ mod test {
             Action::SendPacket(_)
         );
         assert_eq!(listener.sessions.len(), MAX_PENDING_SESSIONS_PER_IP + 1);
+    }
+
+    #[test]
+    fn loopback_sessions_are_not_limited_per_ip() {
+        let start = Instant::now();
+        let mut listener = new_listener(start);
+
+        let loopbacks = [
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            IpAddr::V6(Ipv6Addr::LOCALHOST),
+            IpAddr::V6(Ipv4Addr::LOCALHOST.to_ipv6_mapped()),
+        ];
+        for (n, ip) in loopbacks.iter().enumerate() {
+            for port in 0..MAX_PENDING_SESSIONS_PER_IP + 10 {
+                let addr = SocketAddr::new(*ip, 2000 + port as u16);
+                assert_matches!(induct(&mut listener, start, addr), Action::SendPacket(_));
+            }
+            assert_eq!(
+                listener.sessions.len(),
+                (n + 1) * (MAX_PENDING_SESSIONS_PER_IP + 10)
+            );
+        }
+        assert!(listener.pending.per_ip.is_empty());
+
+        // other addresses are still limited
+        for port in 0..MAX_PENDING_SESSIONS_PER_IP + 10 {
+            let addr = SocketAddr::new(addr_n(0).ip(), 2000 + port as u16);
+            induct(&mut listener, start, addr);
+        }
+        assert_eq!(
+            listener.sessions.len(),
+            loopbacks.len() * (MAX_PENDING_SESSIONS_PER_IP + 10) + MAX_PENDING_SESSIONS_PER_IP
+        );
+
+        // pending loopback sessions are released when they expire
+        listener.handle_input(start + Duration::from_secs(6), Input::Timer);
+        assert!(listener.sessions.is_empty());
+        assert_eq!(listener.pending.total, 0);
+    }
+
+    #[test]
+    fn loopback_sessions_are_limited_in_total() {
+        let start = Instant::now();
+        let mut listener = new_listener(start);
+
+        for n in 0..MAX_PENDING_SESSIONS + 10 {
+            let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1024 + n as u16);
+            induct(&mut listener, start, addr);
+        }
+        assert_eq!(listener.sessions.len(), MAX_PENDING_SESSIONS);
+        assert_eq!(listener.pending.total, MAX_PENDING_SESSIONS);
     }
 
     #[test]
