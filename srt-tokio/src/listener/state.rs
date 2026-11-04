@@ -4,7 +4,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use futures::{channel::mpsc, future::Fuse, prelude::*, select, FutureExt, SinkExt};
+use futures::{channel::mpsc, future::Fuse, prelude::*, select, FutureExt};
 use srt_protocol::{connection::Connection, listener::*, packet::*, settings::ConnInitSettings};
 use tokio::sync::oneshot;
 
@@ -115,13 +115,23 @@ impl SrtListenerState {
         session_id: SessionId,
         request: AccessControlRequest,
     ) -> Result<(), ()> {
-        let request_sender = &mut self.request_sender;
         let response_sender = self.response_sender.clone();
         let (pending, request) =
             PendingConnection::start_approval(session_id, request, response_sender);
-        request_sender.send(request).await.ok().ok_or(())?;
-        let _ = self.pending_connections.insert(session_id, pending);
-        Ok(())
+        // The listener is shared by every connection, so it must not wait for the
+        // application to poll for requests. When the queue is full, or closed, dropping the
+        // request rejects the caller.
+        match self.request_sender.try_send(request) {
+            Ok(()) => {
+                let _ = self.pending_connections.insert(session_id, pending);
+                Ok(())
+            }
+            Err(e) if e.is_full() => {
+                log::debug!("connection request queue full, rejecting {session_id:?}");
+                Ok(())
+            }
+            Err(_) => Err(()),
+        }
     }
 
     async fn reject_connection(
@@ -164,9 +174,105 @@ impl SrtListenerState {
     }
 
     async fn drop_connection(&mut self, session_id: SessionId) -> Result<(), ()> {
+        let _ = self.pending_connections.remove(&session_id);
         match self.open_connections.remove(&session_id) {
             Some(mut connection) => connection.close().await,
             None => Ok(()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use futures::channel::mpsc;
+    use srt_protocol::options::KeySize;
+    use tokio::net::UdpSocket;
+
+    use super::*;
+
+    fn test_state(
+        request_sender: mpsc::Sender<ConnectionRequest>,
+    ) -> (SrtListenerState, oneshot::Sender<()>) {
+        let udp = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        udp.set_nonblocking(true).unwrap();
+        let udp = UdpSocket::from_std(udp).unwrap();
+        let local_address = udp.local_addr().unwrap();
+        let socket = PacketSocket::from_socket(Arc::new(udp), 1024 * 1024);
+        let (statistics_sender, _statistics_receiver) = watch::channel();
+        let (close_sender, close_receiver) = oneshot::channel();
+        let state = SrtListenerState::new(
+            socket,
+            local_address,
+            ConnInitSettings::default(),
+            request_sender,
+            statistics_sender,
+            close_receiver,
+        );
+        (state, close_sender)
+    }
+
+    fn test_access_request(session_id: SessionId) -> AccessControlRequest {
+        AccessControlRequest {
+            local_socket_id: SocketId(1),
+            remote: session_id.0,
+            remote_socket_id: SocketId(2),
+            stream_id: None,
+            key_size: KeySize::Unspecified,
+        }
+    }
+
+    #[tokio::test]
+    async fn full_request_queue_rejects_without_waiting() {
+        // room for a single request, which nothing reads
+        let (request_sender, _request_receiver) = mpsc::channel(0);
+        let (mut state, _close) = test_state(request_sender);
+
+        let first = SessionId("127.0.0.1:9".parse().unwrap());
+        let second = SessionId("127.0.0.1:10".parse().unwrap());
+        for session_id in [first, second] {
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                state.request_access(session_id, test_access_request(session_id)),
+            )
+            .await
+            .expect("the listener must not wait for the application");
+            assert_eq!(result, Ok(()));
+        }
+
+        // only the queued request is pending, the other is answered with a rejection
+        assert_eq!(state.pending_connections.len(), 1);
+        assert!(state.pending_connections.contains_key(&first));
+        let (id, response) = state.response_receiver.next().await.unwrap();
+        assert_eq!(id, second);
+        assert_eq!(response, AccessControlResponse::Dropped);
+    }
+
+    #[tokio::test]
+    async fn dropped_request_is_rejected_and_released() {
+        let (request_sender, mut request_receiver) = mpsc::channel(100);
+        let (mut state, _close) = test_state(request_sender);
+
+        let session_id = SessionId("127.0.0.1:9".parse().unwrap());
+        let request = test_access_request(session_id);
+        state.request_access(session_id, request).await.unwrap();
+        assert_eq!(state.pending_connections.len(), 1);
+
+        // the application drops the request without answering it
+        drop(request_receiver.next().await.unwrap());
+        let (id, response) = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            state.response_receiver.next(),
+        )
+        .await
+        .expect("dropping the request should send a response")
+        .unwrap();
+        assert_eq!(id, session_id);
+        assert_eq!(response, AccessControlResponse::Dropped);
+
+        // the listener turns that into a rejection of the session
+        state.reject_connection(session_id, None).await.unwrap();
+        assert!(state.pending_connections.is_empty());
     }
 }

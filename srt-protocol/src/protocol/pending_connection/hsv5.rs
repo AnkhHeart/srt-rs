@@ -69,7 +69,9 @@ pub fn gen_access_control_response(
         // ok, both sides have crypto
         (Some(key_settings), Some(SrtControlPacket::KeyRefreshRequest(km))) => {
             if key_settings.key_size != incoming.key_size {
-                unimplemented!("Key size mismatch");
+                return GenHsv5Result::Reject(ConnectionReject::Rejecting(
+                    CoreRejectReason::BadSecret.into(),
+                ));
             }
 
             let cipher = match CipherSettings::new(key_settings, &settings.key_refresh, km) {
@@ -85,13 +87,21 @@ pub fn gen_access_control_response(
         // ok, neither have crypto
         (None, None) => None,
         // bad cases
-        (Some(_), Some(_)) => unimplemented!("Expected kmreq"),
+        (Some(_), Some(_)) => {
+            return GenHsv5Result::Reject(ConnectionReject::Rejecting(
+                CoreRejectReason::BadSecret.into(),
+            ))
+        }
         (Some(_), None) => {
             return GenHsv5Result::Reject(ConnectionReject::Rejecting(
                 CoreRejectReason::Unsecure.into(),
             ))
         }
-        (None, Some(_)) => unimplemented!("expected no secrets"),
+        (None, Some(_)) => {
+            return GenHsv5Result::Reject(ConnectionReject::Rejecting(
+                CoreRejectReason::Unsecure.into(),
+            ))
+        }
     };
 
     let outgoing_ext_km = cipher
@@ -137,6 +147,7 @@ pub fn gen_access_control_response(
             bandwidth: settings.bandwidth.clone(),
             local_sockid: settings.local_sockid,
             recv_buffer_size: settings.recv_buffer_size,
+            recv_reorder_tolerance_max: settings.recv_reorder_tolerance_max,
             send_buffer_size: settings.send_buffer_size,
             statistics_interval: settings.statistics_interval,
             peer_idle_timeout: settings.peer_idle_timeout,
@@ -238,6 +249,7 @@ impl StartedInitiator {
             bandwidth: self.settings.bandwidth,
             local_sockid: self.settings.local_sockid,
             recv_buffer_size: self.settings.recv_buffer_size,
+            recv_reorder_tolerance_max: self.settings.recv_reorder_tolerance_max,
             send_buffer_size: self.settings.send_buffer_size,
             statistics_interval: self.settings.statistics_interval,
             peer_idle_timeout: self.settings.peer_idle_timeout,

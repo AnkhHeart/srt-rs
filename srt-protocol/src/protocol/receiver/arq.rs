@@ -193,6 +193,13 @@ impl AutomaticRepeatRequestAlgorithm {
         }
     }
 
+    /// Lets the receiver tolerate reordering up to `max` packets before it
+    /// reports a gap as loss (SRTO_LOSSMAXTTL).
+    pub fn with_reorder_tolerance_max(mut self, max: PacketCount) -> Self {
+        self.receive_buffer = self.receive_buffer.with_reorder_tolerance_max(max);
+        self
+    }
+
     pub fn is_flushed(&self) -> bool {
         self.receive_buffer.is_empty()
             && self

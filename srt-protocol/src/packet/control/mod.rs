@@ -24,7 +24,9 @@ use crate::{
 
 use super::*;
 
-use loss_compression::{compress_loss_list, decompress_loss_list};
+use loss_compression::{
+    compress_loss_list, decompress_loss_list, is_valid_loss_list, is_valid_range,
+};
 
 /// A UDP packet carrying control information
 ///
@@ -632,7 +634,11 @@ impl ControlTypes {
                                             SrtControlPacket::StreamId(stream_id) => {
                                                 sid = Some(stream_id)
                                             }
-                                            _ => unimplemented!("Implement other kinds"),
+                                            // congestion, filter, and group extensions are not supported
+                                            other => warn!(
+                                                "Ignoring unsupported handshake extension {:?}",
+                                                other
+                                            ),
                                         }
                                     }
                                 }
@@ -729,6 +735,10 @@ impl ControlTypes {
                     loss_info.push(buf.get_u32());
                 }
 
+                if !is_valid_loss_list(&loss_info) {
+                    return Err(PacketParseError::BadLossList);
+                }
+
                 Ok(ControlTypes::Nak(CompressedLossList(loss_info)))
             }
             0x4 => {
@@ -762,6 +772,10 @@ impl ControlTypes {
 
                 let start = SeqNumber::new_truncate(buf.get_u32());
                 let end = SeqNumber::new_truncate(buf.get_u32());
+
+                if !is_valid_range(start, end) {
+                    return Err(PacketParseError::BadLossList);
+                }
 
                 Ok(ControlTypes::DropRequest {
                     msg_to_drop: MsgNumber::new_truncate(extra_info), // cast is safe, just reinterpret
@@ -940,8 +954,10 @@ impl Debug for CompressedLossList {
         let mut iter = self.0.iter();
         while let Some(a) = iter.next() {
             if a & 0x80000000 != 0 {
-                let b = iter.next().expect("Unterminated list");
-                write!(f, "{}..={},", a & 0x7fffffff, b)?;
+                match iter.next() {
+                    Some(b) => write!(f, "{}..={},", a & 0x7fffffff, b)?,
+                    None => write!(f, "{}..,", a & 0x7fffffff)?,
+                }
             } else {
                 write!(f, "{a},")?;
             }
@@ -1872,4 +1888,119 @@ mod test {
 
     #[test]
     fn drop_request() {}
+
+    #[test]
+    fn unterminated_loss_list_debug() {
+        let list = CompressedLossList(vec![1 << 31 | 10]);
+        assert_eq!(format!("{list:?}"), "10..,");
+    }
+
+    #[test]
+    fn drop_request_with_invalid_range_is_rejected() {
+        let drop_request = |start: u32, end: u32| {
+            let mut data = vec![0x80, 0x07];
+            data.extend([0u8; 14]);
+            data.extend(start.to_be_bytes());
+            data.extend(end.to_be_bytes());
+            Packet::parse(&mut Cursor::new(&data), false)
+        };
+
+        // end before start
+        assert!(matches!(
+            drop_request(100, 10),
+            Err(PacketParseError::BadLossList)
+        ));
+        // too large
+        assert!(matches!(
+            drop_request(0, 1 << 30),
+            Err(PacketParseError::BadLossList)
+        ));
+        assert!(drop_request(10, 100).is_ok());
+        assert!(drop_request(10, 10).is_ok());
+        // wraps around the maximum sequence number
+        assert!(drop_request(SeqNumber::MAX - 2, 3).is_ok());
+    }
+
+    fn nak_packet(loss_list: &[u32]) -> Vec<u8> {
+        let mut data = vec![0x80, 0x03];
+        data.extend([0u8; 14]);
+        data.extend(loss_list.iter().flat_map(|l| l.to_be_bytes()));
+        data
+    }
+
+    #[test]
+    fn nak_with_invalid_range_is_rejected() {
+        let start = 1u32 << 31;
+        for loss_list in [
+            // end before start
+            vec![start | 100, 10],
+            // unterminated
+            vec![start | 100],
+            // too large
+            vec![start, 1 << 30],
+            // end has the range bit set
+            vec![start | 5, start | 10],
+        ] {
+            let data = nak_packet(&loss_list);
+            assert!(
+                matches!(
+                    Packet::parse(&mut Cursor::new(&data), false),
+                    Err(PacketParseError::BadLossList)
+                ),
+                "{loss_list:?}"
+            );
+        }
+
+        let data = nak_packet(&[(1 << 31) | 10, 100, 200]);
+        assert!(Packet::parse(&mut Cursor::new(&data), false).is_ok());
+    }
+
+    #[test]
+    fn malformed_srt_extension_does_not_panic() {
+        // ext types 5 (stream id) and 8 (group) with an empty body, and the reserved
+        // types 6 and 7
+        for ext_type in [5u8, 6, 7, 8] {
+            let mut data = vec![0xFF, 0xFF, 0x00, ext_type];
+            data.extend([0u8; 12]);
+            assert!(Packet::parse(&mut Cursor::new(&data), false).is_err());
+        }
+    }
+
+    fn conclusion_with_extension(ext_type: u16, body: &[u8]) -> Vec<u8> {
+        let mut data = vec![];
+        data.extend(0x8000_0000u32.to_be_bytes()); // handshake
+        data.extend([0u8; 4]); // additional info
+        data.extend([0u8; 4]); // timestamp
+        data.extend([0u8; 4]); // dest socket id
+        data.extend(5i32.to_be_bytes()); // udt version
+        data.extend([0u8, 0, 0, 4]); // no encryption, CONFIG extension flag
+        data.extend([0u8; 4]); // initial sequence number
+        data.extend(1500u32.to_be_bytes());
+        data.extend(8192u32.to_be_bytes());
+        data.extend((-1i32).to_be_bytes()); // conclusion
+        data.extend(1u32.to_be_bytes()); // socket id
+        data.extend([0u8; 4]); // cookie
+        data.extend([0u8; 16]); // peer address
+        data.extend(ext_type.to_be_bytes());
+        data.extend((body.len() as u16 / 4).to_be_bytes());
+        data.extend(body);
+        // trailing word, so the extension is not mistaken for the end of the packet
+        data.extend([0u8; 4]);
+        data
+    }
+
+    #[test]
+    fn handshake_with_empty_stream_id_extension() {
+        let data = conclusion_with_extension(5, &[]);
+        assert!(Packet::parse(&mut Cursor::new(&data), false).is_err());
+    }
+
+    #[test]
+    fn handshake_with_unsupported_extensions() {
+        for ext_type in [6u16, 7, 8] {
+            let data = conclusion_with_extension(ext_type, &[0, 0, 0, 0]);
+            // must not panic
+            let _ = Packet::parse(&mut Cursor::new(&data), false);
+        }
+    }
 }

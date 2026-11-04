@@ -197,6 +197,7 @@ impl RandomLossSimulation {
             stream_id: None,
             bandwidth: Default::default(),
             recv_buffer_size: PacketCount(8192),
+            recv_reorder_tolerance_max: PacketCount(0),
             send_buffer_size: PacketCount(8192),
             statistics_interval: Duration::from_secs(1),
             peer_idle_timeout: Duration::from_secs(5),

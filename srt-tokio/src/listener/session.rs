@@ -82,7 +82,7 @@ impl PendingConnection {
         let (socket_factory, task_factory) = factory::split_new();
 
         let (settings_sender, settings_receiver) = oneshot::channel();
-        let response_sender = ResponseSender(session_id, response_sender);
+        let response_sender = ResponseSender::new(session_id, response_sender);
 
         let state = PendingConnection {
             settings_sender,
@@ -120,9 +120,15 @@ pub struct OpenConnection {
 }
 
 impl OpenConnection {
+    /// Hands a packet to the connection without waiting. The listener is shared by every
+    /// connection, so a connection that is not keeping up must not stall it; its
+    /// packets are dropped instead.
     pub async fn send(&mut self, packet: (Packet, SocketAddr)) -> Result<(), ()> {
         match self.packet_sender.try_send(Ok(packet)) {
-            Err(e) if e.is_full() => self.packet_sender.send(e.into_inner()).await.ok().ok_or(()),
+            Err(e) if e.is_full() => {
+                log::debug!("connection queue full, dropping packet");
+                Ok(())
+            }
             r => r.ok().ok_or(()),
         }
     }
@@ -133,13 +139,76 @@ impl OpenConnection {
 }
 
 #[derive(Debug)]
-struct ResponseSender(SessionId, mpsc::Sender<(SessionId, AccessControlResponse)>);
+struct ResponseSender {
+    session_id: SessionId,
+    sender: mpsc::Sender<(SessionId, AccessControlResponse)>,
+    answered: bool,
+}
 
 impl ResponseSender {
+    fn new(
+        session_id: SessionId,
+        sender: mpsc::Sender<(SessionId, AccessControlResponse)>,
+    ) -> Self {
+        Self {
+            session_id,
+            sender,
+            answered: false,
+        }
+    }
+
     async fn send(mut self, response: AccessControlResponse) -> Result<(), std::io::Error> {
-        self.1
-            .send((self.0, response))
+        let result = self
+            .sender
+            .send((self.session_id, response))
             .await
-            .map_err(|e| std::io::Error::new(ErrorKind::NotConnected, e))
+            .map_err(|e| std::io::Error::new(ErrorKind::NotConnected, e));
+        self.answered = true;
+        result
+    }
+}
+
+impl Drop for ResponseSender {
+    fn drop(&mut self) {
+        // a request that is dropped without an answer is rejected, so that the caller is not
+        // left waiting and the listener can release the pending connection
+        if !self.answered {
+            let _ = self
+                .sender
+                .try_send((self.session_id, AccessControlResponse::Dropped));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn send_does_not_block_when_full() {
+        let (packet_sender, mut receiver) = mpsc::channel(1);
+        let mut connection = OpenConnection { packet_sender };
+        let addr: SocketAddr = "127.0.0.1:2000".parse().unwrap();
+        let packet = Packet::Control(ControlPacket {
+            timestamp: TimeStamp::from_micros(0),
+            dest_sockid: SocketId(1),
+            control_type: ControlTypes::KeepAlive,
+        });
+
+        // nothing is reading from the receiver, so the channel fills up
+        for _ in 0..10 {
+            let result = tokio::time::timeout(
+                Duration::from_secs(1),
+                connection.send((packet.clone(), addr)),
+            )
+            .await;
+            assert_eq!(result, Ok(Ok(())));
+        }
+
+        // a closed channel is still reported
+        receiver.close();
+        assert_eq!(connection.send((packet, addr)).await, Err(()));
     }
 }
