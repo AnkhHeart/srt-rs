@@ -5,7 +5,7 @@ mod statistics;
 use std::{
     collections::{hash_map::Entry, HashMap},
     fmt::Debug,
-    net::{IpAddr, SocketAddr},
+    net::{IpAddr, Ipv6Addr, SocketAddr},
     time::Duration,
     time::Instant,
 };
@@ -26,7 +26,8 @@ const PENDING_SESSION_TIMEOUT: Duration = Duration::from_secs(5);
 /// The most sessions that have not been opened, in total
 const MAX_PENDING_SESSIONS: usize = 4096;
 
-/// The most sessions that have not been opened for a single remote IP address.
+/// The most sessions that have not been opened for a single remote IP address, where all
+/// IPv6 addresses in the same /64 prefix count as one address.
 /// Loopback addresses are exempt, as a local relay may forward many callers from one address.
 const MAX_PENDING_SESSIONS_PER_IP: usize = 16;
 
@@ -46,18 +47,30 @@ struct PendingCount {
 }
 
 impl PendingCount {
+    /// The address that the per-IP limit is counted against, or `None` for loopback.
+    /// IPv4 addresses are counted individually, IPv6 addresses by their /64 prefix.
+    fn limit_key(ip: IpAddr) -> Option<IpAddr> {
+        match ip.to_canonical() {
+            ip if ip.is_loopback() => None,
+            IpAddr::V6(ip) => Some(IpAddr::V6(Ipv6Addr::from(
+                u128::from(ip) & !u128::from(u64::MAX),
+            ))),
+            ip => Some(ip),
+        }
+    }
+
     fn try_add(&mut self, ip: IpAddr) -> bool {
-        if ip.to_canonical().is_loopback() {
+        let Some(key) = Self::limit_key(ip) else {
             if self.total >= MAX_PENDING_SESSIONS {
                 return false;
             }
             self.total += 1;
             return true;
-        }
-        let count = self.per_ip.entry(ip).or_default();
+        };
+        let count = self.per_ip.entry(key).or_default();
         if self.total >= MAX_PENDING_SESSIONS || *count >= MAX_PENDING_SESSIONS_PER_IP {
             if *count == 0 {
-                self.per_ip.remove(&ip);
+                self.per_ip.remove(&key);
             }
             return false;
         }
@@ -68,7 +81,10 @@ impl PendingCount {
 
     fn release(&mut self, ip: IpAddr) {
         self.total = self.total.saturating_sub(1);
-        if let Entry::Occupied(mut count) = self.per_ip.entry(ip) {
+        let Some(key) = Self::limit_key(ip) else {
+            return;
+        };
+        if let Entry::Occupied(mut count) = self.per_ip.entry(key) {
             *count.get_mut() -= 1;
             if *count.get() == 0 {
                 count.remove();
@@ -497,6 +513,88 @@ mod test {
             Action::SendPacket(_)
         );
         assert_eq!(listener.sessions.len(), MAX_PENDING_SESSIONS_PER_IP + 1);
+    }
+
+    fn v6_addr(prefix: u16, host: u16) -> SocketAddr {
+        SocketAddr::new(
+            IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, prefix, 0, 0, 0, host)),
+            8765,
+        )
+    }
+
+    #[test]
+    fn pending_sessions_are_limited_per_ipv6_prefix() {
+        let start = Instant::now();
+        let mut listener = new_listener(start);
+
+        // different addresses in the same /64 share one limit
+        for host in 0..MAX_PENDING_SESSIONS_PER_IP + 1 {
+            induct(&mut listener, start, v6_addr(1, host as u16 + 1));
+        }
+        assert_eq!(listener.sessions.len(), MAX_PENDING_SESSIONS_PER_IP);
+        assert_eq!(listener.pending.per_ip.len(), 1);
+
+        // other prefixes, and IPv4 addresses, are not affected
+        assert_matches!(
+            induct(&mut listener, start, v6_addr(2, 1)),
+            Action::SendPacket(_)
+        );
+        assert_matches!(
+            induct(&mut listener, start, addr_n(0)),
+            Action::SendPacket(_)
+        );
+        assert_eq!(listener.sessions.len(), MAX_PENDING_SESSIONS_PER_IP + 2);
+        assert_eq!(listener.pending.per_ip.len(), 3);
+
+        // expiring the sessions frees the prefix
+        listener.handle_input(start + Duration::from_secs(6), Input::Timer);
+        assert!(listener.sessions.is_empty());
+        assert_eq!(listener.pending.total, 0);
+        assert!(listener.pending.per_ip.is_empty());
+        assert_matches!(
+            induct(
+                &mut listener,
+                start + Duration::from_secs(6),
+                v6_addr(1, 99)
+            ),
+            Action::SendPacket(_)
+        );
+    }
+
+    #[test]
+    fn pending_release_frees_ipv6_prefix_slot() {
+        let mut pending = PendingCount::default();
+        let a = v6_addr(1, 1).ip();
+        let b = v6_addr(1, 2).ip();
+
+        for _ in 0..MAX_PENDING_SESSIONS_PER_IP {
+            assert!(pending.try_add(a));
+        }
+        assert!(!pending.try_add(b));
+
+        pending.release(b);
+        assert!(pending.try_add(a));
+        assert!(!pending.try_add(a));
+    }
+
+    #[test]
+    fn pending_ipv4_mapped_counts_as_ipv4() {
+        let mut pending = PendingCount::default();
+        let v4 = addr_n(0).ip();
+        let IpAddr::V4(v4_addr) = v4 else {
+            unreachable!()
+        };
+        let mapped = IpAddr::V6(v4_addr.to_ipv6_mapped());
+
+        for _ in 0..MAX_PENDING_SESSIONS_PER_IP {
+            assert!(pending.try_add(mapped));
+        }
+        assert!(!pending.try_add(v4));
+        // a different IPv4 address in the same /24 is counted separately
+        assert!(pending.try_add(addr_n(1).ip()));
+
+        pending.release(v4);
+        assert!(pending.try_add(mapped));
     }
 
     #[test]
