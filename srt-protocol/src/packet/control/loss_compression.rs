@@ -104,6 +104,11 @@ fn range_end(start: SeqNumber, end: u32) -> Option<SeqNumber> {
     (end - start < MAX_LOSS_RANGE).then_some(end)
 }
 
+/// Checks that an inclusive range does not end before it starts, and is of a reasonable size
+pub fn is_valid_range(start: SeqNumber, end: SeqNumber) -> bool {
+    range_end(start, end.as_raw()).is_some()
+}
+
 /// Checks that every range in a compressed loss list is terminated, does not end before
 /// it starts, and is of a reasonable size
 pub fn is_valid_loss_list(loss_list: &[u32]) -> bool {

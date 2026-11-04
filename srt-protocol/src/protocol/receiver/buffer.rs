@@ -380,6 +380,9 @@ impl ReceiveBuffer {
         // if start of the range has been dropped already, just drop everything after
         let first_idx = self.clamped_index_for_seqno(range.start);
         let last_idx = self.clamped_index_for_seqno(range.end);
+        if first_idx >= last_idx {
+            return 0;
+        }
         self.buffer
             .range_mut(first_idx..last_idx)
             .filter_map(|p| p.drop_unreceived())
@@ -1141,6 +1144,12 @@ mod receive_buffer {
 
         // fully out of bounds
         assert_eq!(buf.drop_packets(init_seq_num + 9..init_seq_num + 12), 0);
+
+        // a range that wraps around the maximum sequence number
+        assert_eq!(
+            buf.drop_packets(SeqNumber(SeqNumber::MAX - 2)..SeqNumber(3)),
+            0
+        );
 
         // only drop packets that are marked Lost, i.e. pending NAK
         assert_eq!(buf.drop_packets(init_seq_num - 1..init_seq_num + 5), 3);

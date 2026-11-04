@@ -24,7 +24,9 @@ use crate::{
 
 use super::*;
 
-use loss_compression::{compress_loss_list, decompress_loss_list, is_valid_loss_list};
+use loss_compression::{
+    compress_loss_list, decompress_loss_list, is_valid_loss_list, is_valid_range,
+};
 
 /// A UDP packet carrying control information
 ///
@@ -770,6 +772,10 @@ impl ControlTypes {
 
                 let start = SeqNumber::new_truncate(buf.get_u32());
                 let end = SeqNumber::new_truncate(buf.get_u32());
+
+                if !is_valid_range(start, end) {
+                    return Err(PacketParseError::BadLossList);
+                }
 
                 Ok(ControlTypes::DropRequest {
                     msg_to_drop: MsgNumber::new_truncate(extra_info), // cast is safe, just reinterpret
@@ -1887,6 +1893,32 @@ mod test {
     fn unterminated_loss_list_debug() {
         let list = CompressedLossList(vec![1 << 31 | 10]);
         assert_eq!(format!("{list:?}"), "10..,");
+    }
+
+    #[test]
+    fn drop_request_with_invalid_range_is_rejected() {
+        let drop_request = |start: u32, end: u32| {
+            let mut data = vec![0x80, 0x07];
+            data.extend([0u8; 14]);
+            data.extend(start.to_be_bytes());
+            data.extend(end.to_be_bytes());
+            Packet::parse(&mut Cursor::new(&data), false)
+        };
+
+        // end before start
+        assert!(matches!(
+            drop_request(100, 10),
+            Err(PacketParseError::BadLossList)
+        ));
+        // too large
+        assert!(matches!(
+            drop_request(0, 1 << 30),
+            Err(PacketParseError::BadLossList)
+        ));
+        assert!(drop_request(10, 100).is_ok());
+        assert!(drop_request(10, 10).is_ok());
+        // wraps around the maximum sequence number
+        assert!(drop_request(SeqNumber::MAX - 2, 3).is_ok());
     }
 
     fn nak_packet(loss_list: &[u32]) -> Vec<u8> {
