@@ -537,6 +537,13 @@ mod test {
         assert_eq!(listener.pending.total, 0);
         assert_eq!(listener.sessions.len(), 1);
 
+        // a late response for an open session is ignored
+        let action = listener.handle_input(
+            start,
+            Input::AccessResponse(Some((session_id(), AccessControlResponse::Dropped))),
+        );
+        assert_eq!(action, Action::WaitForInput);
+
         // an open session is kept while the connection is alive, then released
         let idle = listener.settings.peer_idle_timeout;
         let action = listener.handle_input(start + idle, Input::Timer);

@@ -82,7 +82,7 @@ impl PendingConnection {
         let (socket_factory, task_factory) = factory::split_new();
 
         let (settings_sender, settings_receiver) = oneshot::channel();
-        let response_sender = ResponseSender(session_id, response_sender);
+        let response_sender = ResponseSender::new(session_id, response_sender);
 
         let state = PendingConnection {
             settings_sender,
@@ -139,14 +139,44 @@ impl OpenConnection {
 }
 
 #[derive(Debug)]
-struct ResponseSender(SessionId, mpsc::Sender<(SessionId, AccessControlResponse)>);
+struct ResponseSender {
+    session_id: SessionId,
+    sender: mpsc::Sender<(SessionId, AccessControlResponse)>,
+    answered: bool,
+}
 
 impl ResponseSender {
+    fn new(
+        session_id: SessionId,
+        sender: mpsc::Sender<(SessionId, AccessControlResponse)>,
+    ) -> Self {
+        Self {
+            session_id,
+            sender,
+            answered: false,
+        }
+    }
+
     async fn send(mut self, response: AccessControlResponse) -> Result<(), std::io::Error> {
-        self.1
-            .send((self.0, response))
+        let result = self
+            .sender
+            .send((self.session_id, response))
             .await
-            .map_err(|e| std::io::Error::new(ErrorKind::NotConnected, e))
+            .map_err(|e| std::io::Error::new(ErrorKind::NotConnected, e));
+        self.answered = true;
+        result
+    }
+}
+
+impl Drop for ResponseSender {
+    fn drop(&mut self) {
+        // a request that is dropped without an answer is rejected, so that the caller is not
+        // left waiting and the listener can release the pending connection
+        if !self.answered {
+            let _ = self
+                .sender
+                .try_send((self.session_id, AccessControlResponse::Dropped));
+        }
     }
 }
 

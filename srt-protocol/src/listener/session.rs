@@ -66,7 +66,8 @@ impl SessionState {
                 let reject = reject.clone();
                 self.reject(session_id, reject)
             }
-            Open => unreachable!("this should not happen"),
+            // a late or duplicate response for a session that is already open
+            Open => Action::WaitForInput,
             Dropping => Action::DropConnection(session_id),
         }
     }

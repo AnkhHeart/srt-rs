@@ -290,6 +290,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dropped_request_rejects_caller() {
+        let (_server, mut incoming) = SrtListener::builder().bind("127.0.0.1:4006").await.unwrap();
+
+        // the application refuses callers by dropping their requests
+        tokio::spawn(async move {
+            while let Some(request) = incoming.incoming().next().await {
+                drop(request);
+            }
+        });
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            SrtSocket::builder().call("127.0.0.1:4006", None),
+        )
+        .await
+        .expect("the caller should be answered before timing out");
+        assert_eq!(
+            result.err().map(|e| e.kind()),
+            Some(io::ErrorKind::ConnectionRefused)
+        );
+    }
+
+    #[tokio::test]
     async fn multiplex_timeout() {
         use bytes::Bytes;
         use futures::{stream, SinkExt, StreamExt};

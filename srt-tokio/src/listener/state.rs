@@ -171,3 +171,59 @@ impl SrtListenerState {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use futures::channel::mpsc;
+    use srt_protocol::options::KeySize;
+    use tokio::net::UdpSocket;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn dropped_request_is_rejected_and_released() {
+        let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let local_address = udp.local_addr().unwrap();
+        let socket = PacketSocket::from_socket(Arc::new(udp), 1024 * 1024);
+        let (request_sender, mut request_receiver) = mpsc::channel(100);
+        let (statistics_sender, _statistics_receiver) = watch::channel();
+        let (_close_sender, close_receiver) = oneshot::channel();
+        let mut state = SrtListenerState::new(
+            socket,
+            local_address,
+            ConnInitSettings::default(),
+            request_sender,
+            statistics_sender,
+            close_receiver,
+        );
+
+        let session_id = SessionId("127.0.0.1:9".parse().unwrap());
+        let request = AccessControlRequest {
+            local_socket_id: SocketId(1),
+            remote: session_id.0,
+            remote_socket_id: SocketId(2),
+            stream_id: None,
+            key_size: KeySize::Unspecified,
+        };
+        state.request_access(session_id, request).await.unwrap();
+        assert_eq!(state.pending_connections.len(), 1);
+
+        // the application drops the request without answering it
+        drop(request_receiver.next().await.unwrap());
+        let (id, response) = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            state.response_receiver.next(),
+        )
+        .await
+        .expect("dropping the request should send a response")
+        .unwrap();
+        assert_eq!(id, session_id);
+        assert_eq!(response, AccessControlResponse::Dropped);
+
+        // the listener turns that into a rejection of the session
+        state.reject_connection(session_id, None).await.unwrap();
+        assert!(state.pending_connections.is_empty());
+    }
+}
